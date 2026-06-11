@@ -168,8 +168,18 @@ async function main() {
 		queries.map(({ key, dbId, sql }) => {
 			const start = Date.now();
 			return runQuery(sessionToken, dbId, sql)
-				.then((result) => ({ key, result, error: null, elapsed: ((Date.now() - start) / 1000).toFixed(1) }))
-				.catch((err) => ({ key, result: null, error: err.message, elapsed: ((Date.now() - start) / 1000).toFixed(1) }));
+				.then((result) => ({
+					key,
+					result,
+					error: null,
+					elapsed: ((Date.now() - start) / 1000).toFixed(1),
+				}))
+				.catch((err) => ({
+					key,
+					result: null,
+					error: err.message,
+					elapsed: ((Date.now() - start) / 1000).toFixed(1),
+				}));
 		}),
 	);
 
@@ -208,25 +218,26 @@ async function main() {
 		return Array.from(counts.entries());
 	};
 
-	line("--------------------------------");
-	blank();
-	line(`Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`);
+	line(
+		`Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`,
+	);
 	blank();
 
-	// Radar bugs
+	// 1. Radar bugs
 	const radarBugs = byKey.radarBugs;
 	if (radarBugs.error) {
-		line(`Radar Bugs error: ${radarBugs.error}`);
+		line(`1. Radar Bug Count: ERR — ${radarBugs.error}`);
 	} else {
 		const subjects = colValues(radarBugs.result, "subject");
-		line(`Radar Bug Count: ${subjects.length} (${radarBugs.elapsed}s)`);
-		blank();
-		subjects.forEach((s) => line(s ?? "N/A"));
+		line(`1. Radar Bug Count: ${subjects.length}`);
+		subjects.forEach((s, i) =>
+			line(`   ${String.fromCharCode(97 + i)}. ${s ?? "N/A"}`),
+		);
 	}
 
 	blank();
 
-	// 500 errors
+	// 2. 500 errors
 	const errUs = byKey.errors500Us;
 	const errEu = byKey.errors500Eu;
 	const usMessages = errUs.error ? [] : colValues(errUs.result, "message");
@@ -234,31 +245,68 @@ async function main() {
 	const usCount = errUs.error ? "ERR" : usMessages.length;
 	const euCount = errEu.error ? "ERR" : euMessages.length;
 
-	line(`500 Errors: ${usCount} (US) ${euCount} (EU) (${errUs.elapsed}s / ${errEu.elapsed}s)`);
-	blank();
-	if (errUs.error) line(`US error: ${errUs.error}`);
-	else groupByMessage(usMessages).forEach(([msg, count]) => line(`${count} : ${msg}`));
-	if (errEu.error) line(`EU error: ${errEu.error}`);
-	else groupByMessage(euMessages).forEach(([msg, count]) => line(`${count} : ${msg}`));
+	line(`2. 500 Errors: ${usCount} (US) ${euCount} (EU)`);
+	if (errUs.error) line(`   US error: ${errUs.error}`);
+	else
+		groupByMessage(usMessages).forEach(([msg, count], i) =>
+			line(`   ${String.fromCharCode(97 + i)}. ${count} : ${msg}`),
+		);
+	if (errEu.error) line(`   EU error: ${errEu.error}`);
+	else
+		groupByMessage(euMessages).forEach(([msg, count], i) =>
+			line(`   ${String.fromCharCode(97 + i)}. ${count} : ${msg}`),
+		);
 
 	blank();
 
-	// Query performance
+	// 3. Query performance
 	const perf = byKey.performance;
-	line(`3. Query Performance Breakdown (${perf.elapsed}s)`);
-	line("   a. MySQL Query Performance");
+	line("3. Query Performance Breakdown");
 	blank();
 	if (perf.error) {
-		line(`Performance error: ${perf.error}`);
+		line(`   Performance error: ${perf.error}`);
 	} else {
 		const val = (col) => colValues(perf.result, col)[0] ?? 0;
-		const total = val("mysql_total");
-		line(`Total Queries: ${fmtNum(total)}`);
-		line(`50 – 100 ms:    ${fmtNum(val("mysql_50_100ms"))} (${pct(val("mysql_50_100ms"), total)})`);
-		line(`100 – 200 ms:   ${fmtNum(val("mysql_101_200ms"))} (${pct(val("mysql_101_200ms"), total)})`);
-		line(`200 – 500 ms:   ${fmtNum(val("mysql_201_500ms"))} (${pct(val("mysql_201_500ms"), total)})`);
-		line(`500 – 1000 ms:  ${fmtNum(val("mysql_501_1000ms"))} (${pct(val("mysql_501_1000ms"), total)})`);
-		line(`> 1000 ms:      ${fmtNum(val("mysql_gt_1000ms"))} (${pct(val("mysql_gt_1000ms"), total)})`);
+
+		line("   a. MySQL Query Performance");
+		const mysqlTotal = val("mysql_total");
+		line(`   Total Queries: ${fmtNum(mysqlTotal)}`);
+		line(
+			`   50 – 100 ms:   ${fmtNum(val("mysql_50_100ms"))} (${pct(val("mysql_50_100ms"), mysqlTotal)})`,
+		);
+		line(
+			`   100 – 200 ms:  ${fmtNum(val("mysql_101_200ms"))} (${pct(val("mysql_101_200ms"), mysqlTotal)})`,
+		);
+		line(
+			`   200 – 500 ms:  ${fmtNum(val("mysql_201_500ms"))} (${pct(val("mysql_201_500ms"), mysqlTotal)})`,
+		);
+		line(
+			`   500 – 1000 ms: ${fmtNum(val("mysql_501_1000ms"))} (${pct(val("mysql_501_1000ms"), mysqlTotal)})`,
+		);
+		line(
+			`   > 1000 ms:     ${fmtNum(val("mysql_gt_1000ms"))} (${pct(val("mysql_gt_1000ms"), mysqlTotal)})`,
+		);
+
+		blank();
+
+		line("   b. Clickhouse Query Performance");
+		const clickTotal = val("click_total");
+		line(`   Total Queries: ${fmtNum(clickTotal)}`);
+		line(
+			`   50 – 100 ms:   ${fmtNum(val("click_50_100ms"))} (${pct(val("click_50_100ms"), clickTotal)})`,
+		);
+		line(
+			`   100 – 200 ms:  ${fmtNum(val("click_101_200ms"))} (${pct(val("click_101_200ms"), clickTotal)})`,
+		);
+		line(
+			`   200 – 500 ms:  ${fmtNum(val("click_200_500ms"))} (${pct(val("click_200_500ms"), clickTotal)})`,
+		);
+		line(
+			`   500 – 1000 ms: ${fmtNum(val("click_500_1000ms"))} (${pct(val("click_500_1000ms"), clickTotal)})`,
+		);
+		line(
+			`   > 1000 ms:     ${fmtNum(val("click_gt_10s"))} (${pct(val("click_gt_10s"), clickTotal)})`,
+		);
 	}
 
 	console.log(lines.join("\n"));
