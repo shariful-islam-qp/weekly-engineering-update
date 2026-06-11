@@ -1,0 +1,15 @@
+{
+  "name": "engineering-updates",
+  "version": "1.0.0",
+  "description": "Metabase query runner for engineering updates",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "cli-table3": "^0.6.3",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3"
+  }
+}
