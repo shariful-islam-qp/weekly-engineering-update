@@ -47,6 +47,37 @@ function fiveHundredErrorSql(startDate, endDate) {
   `;
 }
 
+function topSlowMysqlSql(startDate, endDate) {
+	return `
+    SELECT
+      pl.url,
+      pl.method,
+      jt.sql_query AS query,
+      COUNT(*) AS occurrences,
+      AVG(jt.timeTaken) AS avgTimeTaken,
+      MAX(jt.timeTaken) AS maxTimeTaken
+    FROM akira_xa3.performance_log pl,
+    JSON_TABLE(
+      pl.queries,
+      '$[*]' COLUMNS (
+        sql_query VARCHAR(5000) PATH '$.sql',
+        timeTaken INT PATH '$.timeTaken',
+        dbType VARCHAR(50) PATH '$.databaseType'
+      )
+    ) AS jt
+    WHERE
+      jt.timeTaken > 200
+      AND jt.dbType = 'MYSQL'
+      AND jt.sql_query IS NOT NULL
+      AND TRIM(jt.sql_query) <> ''
+      AND pl.source_environment = 'qpprod'
+      AND pl.created_at BETWEEN '${startDate}' AND '${endDate}'
+    GROUP BY jt.sql_query
+    ORDER BY maxTimeTaken DESC
+    LIMIT 3
+  `;
+}
+
 function mysqlAndClickhousePerformanceSql(startDate, endDate) {
 	return `
     WITH base AS (
@@ -160,6 +191,11 @@ async function main() {
 			dbId: US_DB_ID,
 			sql: mysqlAndClickhousePerformanceSql(startDate, endDate),
 		},
+		{
+			key: "slowQueries",
+			dbId: US_DB_ID,
+			sql: topSlowMysqlSql(startDate, endDate),
+		},
 	];
 
 	console.log(`Running ${queries.length} queries in parallel...\n`);
@@ -219,7 +255,9 @@ async function main() {
 	};
 
 	line(
-		`Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`,
+		` ================================================`,
+		` Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`,
+		` ================================================`,
 	);
 	blank();
 
@@ -307,6 +345,45 @@ async function main() {
 		line(
 			`   > 1000 ms:     ${fmtNum(val("click_gt_10s"))} (${pct(val("click_gt_10s"), clickTotal)})`,
 		);
+	}
+
+	blank();
+
+	// 4. Top 3 slowest queries
+	const slow = byKey.slowQueries;
+	line("4. Top 3 Slowest Queries");
+	blank();
+	if (slow.error) {
+		line(`   Slow queries error: ${slow.error}`);
+	} else {
+		const rows = slow.result.data.rows;
+		const cols = slow.result.data.cols;
+		const colIdx = (name) =>
+			cols.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+
+		const qIdx = colIdx("query");
+		const oIdx = colIdx("occurrences");
+		const maxIdx = colIdx("maxTimeTaken");
+		const avgIdx = colIdx("avgTimeTaken");
+
+		rows.slice(0, 3).forEach((row, i) => {
+			const letter = String.fromCharCode(97 + i);
+			const occurrences = row[oIdx] ?? "N/A";
+			const maxMs =
+				row[maxIdx] != null ? `${fmtNum(Math.round(row[maxIdx]))} ms` : "N/A";
+			const avgMs =
+				row[avgIdx] != null ? `${fmtNum(Math.round(row[avgIdx]))} ms` : "N/A";
+			const rawQuery = (row[qIdx] ?? "N/A")
+				.replace(/`/g, "")
+				.replace(/\s+/g, " ")
+				.trim();
+
+			line(
+				`   ${letter}. [${occurrences} occurrences] [max: ${maxMs} | avg: ${avgMs}]`,
+			);
+			line(`      ${rawQuery}`);
+			blank();
+		});
 	}
 
 	console.log(lines.join("\n"));
