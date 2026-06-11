@@ -10,28 +10,26 @@ function client(sessionToken) {
 	});
 }
 
-async function getDatabaseId(sessionToken, dbName) {
-	const { data } = await client(sessionToken).get("/api/database");
-	const databases = data.data ?? data;
-	const db = databases.find(
-		(d) => d.name.toLowerCase() === dbName.toLowerCase(),
-	);
-	if (!db) {
-		const names = databases.map((d) => d.name).join(", ");
-		throw new Error(`Database "${dbName}" not found. Available: ${names}`);
+async function runQuery(sessionToken, databaseId, sql, retries = 3) {
+	for (let attempt = 1; attempt <= retries; attempt++) {
+		try {
+			const { data } = await client(sessionToken).post("/api/dataset", {
+				database: databaseId,
+				type: "native",
+				native: { query: sql },
+			});
+			if (data.error) throw new Error(`Query error: ${data.error}`);
+			return data;
+		} catch (err) {
+			const isSocketError = err.code === "ECONNRESET" || err.message === "socket hang up";
+			if (isSocketError && attempt < retries) {
+				console.warn(`Attempt ${attempt} failed (socket hang up), retrying...`);
+				await new Promise((r) => setTimeout(r, 3000 * attempt));
+			} else {
+				throw err;
+			}
+		}
 	}
-	return db.id;
 }
 
-async function runQuery(sessionToken, databaseId, sql) {
-	// console.log("sql", sql);
-	const { data } = await client(sessionToken).post("/api/dataset", {
-		database: databaseId,
-		type: "native",
-		native: { query: sql },
-	});
-	if (data.error) throw new Error(`Query error: ${data.error}`);
-	return data;
-}
-
-module.exports = { getDatabaseId, runQuery };
+module.exports = { runQuery };
