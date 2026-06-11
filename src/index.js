@@ -1,11 +1,12 @@
 require("dotenv").config();
 const { getDatabaseId, runQuery } = require("./metabase");
-const { displayResults } = require("./display");
 
 // const US_DB = "qp_metabase";
 // const EU_DB = "euqpdb2 - [QP-EU]";
 // const GLOBAL_DB = "GLOBAL WAREHOUSE";
 const GLOBAL_DB_ID = 172;
+const US_DB_ID = 2;
+const EU_DB_ID = 105;
 
 // Returns Saturday–Friday date range for the current week.
 // Week always starts on Saturday and ends on Friday.
@@ -26,7 +27,7 @@ function getWeekDateRange() {
 
 function radarBugSql(startDate, endDate) {
 	return `
-    SELECT COUNT(1) AS radar_bug_count
+    SELECT *
     FROM rt_ticket
     WHERE product_id = 21
       AND channel_id IN (9)
@@ -36,20 +37,20 @@ function radarBugSql(startDate, endDate) {
   `;
 }
 
-// function fiveHundredErrorSql(startDate, endDate) {
-// 	return `
-//     SELECT *
-//     FROM akira_xa3.error_log
-//     WHERE
-//         status = 500
-//         AND environment = "qpprod"
-//         AND path !="/api/health"
-//         AND path NOT LIKE '%pathos%'
-//         AND path NOT LIKE '%text-ai%'
-//         AND created_at BETWEEN '${startDate}' AND '${endDate}'
-//     ORDER BY id DESC
-//   `;
-// }
+function fiveHundredErrorSql(startDate, endDate) {
+	return `
+    SELECT *
+    FROM akira_xa3.error_log
+    WHERE
+        status = 500
+        AND environment = "qpprod"
+        AND path != "/api/health"
+        AND path NOT LIKE '%pathos%'
+        AND path NOT LIKE '%text-ai%'
+        AND created_at BETWEEN '${startDate}' AND '${endDate}'
+    ORDER BY id DESC
+  `;
+}
 
 async function main() {
 	const sessionToken = process.env.METABASE_SESSION_TOKEN;
@@ -60,61 +61,99 @@ async function main() {
 	}
 
 	const { startDate, endDate } = getWeekDateRange();
-	console.log(`Week range: ${startDate} to ${endDate}\n`);
-
-	console.log("Fetching database IDs...");
-	// const [usDbId, euDbId, globalDbId] = await Promise.all([
-	// 	getDatabaseId(sessionToken, US_DB),
-	// 	getDatabaseId(sessionToken, EU_DB),
-	// 	getDatabaseId(sessionToken, GLOBAL_DB),
-	// ]);
-	// console.log(
-	// 	`US db id=${usDbId}, EU db id=${euDbId}, Global db id=${globalDbId}\n`,
-	// );
 
 	const queries = [
 		{
-			label: "Radar Bug Count (Global)",
+			key: "radarBugs",
 			dbId: GLOBAL_DB_ID,
 			sql: radarBugSql(startDate, endDate),
 		},
-		// {
-		// 	label: "Radar Bug Count (EU)",
-		// 	dbId: euDbId,
-		// 	sql: radarBugSql(startDate, endDate),
-		// },
-		// {
-		// 	label: "500 Error Count (US)",
-		// 	dbId: usDbId,
-		// 	sql: fiveHundredErrorSql(startDate, endDate),
-		// },
-		// {
-		// 	label: "500 Error Count (EU)",
-		// 	dbId: euDbId,
-		// 	sql: fiveHundredErrorSql(startDate, endDate),
-		// },
+		{
+			key: "errors500Us",
+			dbId: US_DB_ID,
+			sql: fiveHundredErrorSql(startDate, endDate),
+		},
+		{
+			key: "errors500Eu",
+			dbId: EU_DB_ID,
+			sql: fiveHundredErrorSql(startDate, endDate),
+		},
 	];
 
-	console.log(`Running ${queries.length} queries in parallel...`);
+	console.log(`Running ${queries.length} queries in parallel...\n`);
 
-	const results = await Promise.all(
-		queries.map(({ label, dbId, sql }) =>
+	const rawResults = await Promise.all(
+		queries.map(({ key, dbId, sql }) =>
 			runQuery(sessionToken, dbId, sql)
-				.then((result) => ({ label, result, error: null }))
-				.catch((err) => ({ label, result: null, error: err.message })),
+				.then((result) => ({ key, result, error: null }))
+				.catch((err) => ({ key, result: null, error: err.message })),
 		),
 	);
 
-	console.log("\n========== Weekly Engineering Update ==========\n");
-	for (const { label, result, error } of results) {
-		console.log(`--- ${label} ---`);
-		if (error) {
-			console.error(`  Error: ${error}`);
-		} else {
-			displayResults(result);
-		}
-		console.log();
+	const byKey = Object.fromEntries(rawResults.map((r) => [r.key, r]));
+
+	const fmtDate = (dateStr) => {
+		const [y, m, d] = dateStr.split("-");
+		return new Date(y, m - 1, d).toLocaleDateString("en-US", {
+			month: "long",
+			day: "numeric",
+			year: "numeric",
+		});
+	};
+
+	const colValues = (result, colName) => {
+		const idx = result.data.cols.findIndex(
+			(c) => c.name.toLowerCase() === colName.toLowerCase(),
+		);
+		if (idx === -1) return result.data.rows.map(() => null);
+		return result.data.rows.map((row) => row[idx] ?? null);
+	};
+	const lines = [];
+	const line = (text) => lines.push(text);
+	const blank = () => lines.push("");
+
+	line("--------------------------------");
+	blank();
+	line(`Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`);
+	blank();
+
+	// Radar bugs
+	const radarBugs = byKey.radarBugs;
+	if (radarBugs.error) {
+		line(`Radar Bugs error: ${radarBugs.error}`);
+	} else {
+		const subjects = colValues(radarBugs.result, "subject");
+		line(`Radar Bug Count: ${subjects.length}`);
+		blank();
+		subjects.forEach((s, i) =>
+			line(`${String.fromCharCode(97 + i)}. ${s ?? "N/A"}`),
+		);
 	}
+
+	blank();
+
+	// 500 errors
+	const errUs = byKey.errors500Us;
+	const errEu = byKey.errors500Eu;
+	const usMessages = errUs.error ? [] : colValues(errUs.result, "message");
+	const euMessages = errEu.error ? [] : colValues(errEu.result, "message");
+	const usCount = errUs.error ? "ERR" : usMessages.length;
+	const euCount = errEu.error ? "ERR" : euMessages.length;
+
+	line(`500 Errors: ${usCount} (US) ${euCount} (EU)`);
+	blank();
+	if (errUs.error) line(`US error: ${errUs.error}`);
+	else
+		usMessages.forEach((m, i) =>
+			line(`${String.fromCharCode(97 + i)}. ${m ?? "N/A"}`),
+		);
+	if (errEu.error) line(`EU error: ${errEu.error}`);
+	else
+		euMessages.forEach((m, i) =>
+			line(`${String.fromCharCode(97 + i)}. ${m ?? "N/A"}`),
+		);
+
+	console.log(lines.join("\n"));
 }
 
 main().catch((err) => {

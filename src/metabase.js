@@ -16,7 +16,6 @@ async function getDatabaseId(sessionToken, dbName) {
 	const db = databases.find(
 		(d) => d.name.toLowerCase() === dbName.toLowerCase(),
 	);
-	console.log("db", db);
 	if (!db) {
 		const names = databases.map((d) => d.name).join(", ");
 		throw new Error(`Database "${dbName}" not found. Available: ${names}`);
@@ -25,27 +24,11 @@ async function getDatabaseId(sessionToken, dbName) {
 }
 
 async function runQuery(sessionToken, databaseId, sql) {
-	console.log("sql", JSON.stringify(sql));
+	// console.log("sql", sql);
 	const { data } = await client(sessionToken).post("/api/dataset", {
 		database: databaseId,
 		type: "native",
-		native: {
-			query: sql,
-			"template-tags": {
-				startDate: {
-					name: "startDate",
-					"display-name": "Start Date",
-					type: "date",
-					required: true,
-				},
-				endDate: {
-					name: "endDate",
-					"display-name": "End Date",
-					type: "date",
-					required: true,
-				},
-			},
-		},
+		native: { query: sql },
 	});
 	if (data.error) throw new Error(`Query error: ${data.error}`);
 	return data;
