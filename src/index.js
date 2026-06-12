@@ -1,15 +1,10 @@
 require("dotenv").config();
-const { getDatabaseId, runQuery } = require("./metabase");
+const { runQuery } = require("./metabase");
 
-// const US_DB = "qp_metabase";
-// const EU_DB = "euqpdb2 - [QP-EU]";
-// const GLOBAL_DB = "GLOBAL WAREHOUSE";
 const GLOBAL_DB_ID = 172;
 const US_DB_ID = 2;
 const EU_DB_ID = 105;
 
-// Returns Saturday–Friday date range for the current week.
-// Week always starts on Saturday and ends on Friday.
 function getWeekDateRange() {
 	const today = new Date();
 	const dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
@@ -52,6 +47,119 @@ function fiveHundredErrorSql(startDate, endDate) {
   `;
 }
 
+function topSlowMysqlSql(startDate, endDate) {
+	return `
+    SELECT
+      pl.url,
+      pl.method,
+      jt.sql_query AS query,
+      COUNT(*) AS occurrences,
+      AVG(jt.timeTaken) AS avgTimeTaken,
+      MAX(jt.timeTaken) AS maxTimeTaken
+    FROM akira_xa3.performance_log pl,
+    JSON_TABLE(
+      pl.queries,
+      '$[*]' COLUMNS (
+        sql_query VARCHAR(5000) PATH '$.sql',
+        timeTaken INT PATH '$.timeTaken',
+        dbType VARCHAR(50) PATH '$.databaseType'
+      )
+    ) AS jt
+    WHERE
+      jt.timeTaken > 200
+      AND jt.dbType = 'MYSQL'
+      AND jt.sql_query IS NOT NULL
+      AND TRIM(jt.sql_query) <> ''
+      AND pl.source_environment = 'qpprod'
+      AND pl.created_at BETWEEN '${startDate}' AND '${endDate}'
+    GROUP BY jt.sql_query
+    ORDER BY maxTimeTaken DESC
+    LIMIT 3
+  `;
+}
+
+function mysqlAndClickhousePerformanceSql(startDate, endDate) {
+	return `
+    WITH base AS (
+      SELECT
+        p.id,
+        p.created_at,
+        p.queries
+      FROM akira_xa3.performance_log p
+      WHERE p.source_environment = 'qpprod'
+        AND p.created_at BETWEEN '${startDate}' AND '${endDate}'
+    ),
+
+    expanded AS (
+      SELECT
+        b.id,
+        b.created_at,
+        q.databaseType,
+        CASE
+          WHEN q.timeTaken IS NULL OR TRIM(q.timeTaken) = '' THEN NULL
+          ELSE CAST(q.timeTaken AS UNSIGNED)
+        END AS timeTaken_ms
+      FROM base b
+      JOIN JSON_TABLE(
+        CAST(b.queries AS JSON),
+        '$[*]' COLUMNS (
+          timeTaken VARCHAR(50) PATH '$.timeTaken',
+          databaseType VARCHAR(20) PATH '$.databaseType'
+        )
+      ) q
+    )
+
+    SELECT
+      /* ================================
+        TOTAL COUNTS
+      ================================= */
+      (
+        SELECT SUM(JSON_LENGTH(CAST(queries AS JSON)))
+        FROM base
+      ) AS totalQueryCount_claimed,
+
+      COUNT(*) AS total_expanded_rows,
+
+      /* ================================
+        OVERALL BUCKETS (ms)
+      ================================= */
+      SUM(timeTaken_ms < 50) AS all_lt_50ms,
+      SUM(timeTaken_ms BETWEEN 50 AND 100) AS all_50_100ms,
+      SUM(timeTaken_ms BETWEEN 101 AND 200) AS all_101_200ms,
+      SUM(timeTaken_ms > 200) AS all_gt_200ms,
+
+      /* ================================
+        MYSQL BUCKETS
+      ================================= */
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms < 50) AS mysql_lt_50ms,
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms BETWEEN 50 AND 100) AS mysql_50_100ms,
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms BETWEEN 101 AND 200) AS mysql_101_200ms,
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms BETWEEN 201 AND 500) AS mysql_201_500ms,
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms BETWEEN 501 AND 1000) AS mysql_501_1000ms,
+      SUM(databaseType = 'MYSQL' AND timeTaken_ms > 1001) AS mysql_gt_1000ms,
+      SUM(databaseType = 'MYSQL') AS mysql_total,
+
+      /* ================================
+        CLICKHOUSE BUCKETS
+      ================================= */
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms < 50) AS click_lt_50ms,
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms BETWEEN 50 AND 100) AS click_50_100ms,
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms BETWEEN 101 AND 200) AS click_101_200ms,
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms BETWEEN 201 and 500) AS click_200_500ms,
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms BETWEEN 501 and 1000)  AS click_500_1000ms,
+      SUM(databaseType = 'CLICKHOUSE' AND timeTaken_ms > 1000) AS click_gt_10s,
+      SUM(databaseType = 'CLICKHOUSE') AS click_total,
+
+      /* ================================
+        NULL / MISSING
+      ================================= */
+      SUM(timeTaken_ms IS NULL) AS missing_timeTaken,
+      SUM(databaseType IS NULL) AS missing_databaseType
+
+    FROM expanded;
+  `;
+}
+
 async function main() {
 	const sessionToken = process.env.METABASE_SESSION_TOKEN;
 	if (!sessionToken) {
@@ -78,16 +186,37 @@ async function main() {
 			dbId: EU_DB_ID,
 			sql: fiveHundredErrorSql(startDate, endDate),
 		},
+		{
+			key: "performance",
+			dbId: US_DB_ID,
+			sql: mysqlAndClickhousePerformanceSql(startDate, endDate),
+		},
+		{
+			key: "slowQueries",
+			dbId: US_DB_ID,
+			sql: topSlowMysqlSql(startDate, endDate),
+		},
 	];
 
 	console.log(`Running ${queries.length} queries in parallel...\n`);
 
 	const rawResults = await Promise.all(
-		queries.map(({ key, dbId, sql }) =>
-			runQuery(sessionToken, dbId, sql)
-				.then((result) => ({ key, result, error: null }))
-				.catch((err) => ({ key, result: null, error: err.message })),
-		),
+		queries.map(({ key, dbId, sql }) => {
+			const start = Date.now();
+			return runQuery(sessionToken, dbId, sql)
+				.then((result) => ({
+					key,
+					result,
+					error: null,
+					elapsed: ((Date.now() - start) / 1000).toFixed(1),
+				}))
+				.catch((err) => ({
+					key,
+					result: null,
+					error: err.message,
+					elapsed: ((Date.now() - start) / 1000).toFixed(1),
+				}));
+		}),
 	);
 
 	const byKey = Object.fromEntries(rawResults.map((r) => [r.key, r]));
@@ -112,27 +241,41 @@ async function main() {
 	const line = (text) => lines.push(text);
 	const blank = () => lines.push("");
 
-	line("--------------------------------");
-	blank();
-	line(`Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`);
+	const fmtNum = (n) => Number(n ?? 0).toLocaleString("en-US");
+	const pct = (n, total) =>
+		total > 0 ? ((n / total) * 100).toFixed(4) + "%" : "0.0000%";
+
+	const groupByMessage = (messages) => {
+		const counts = new Map();
+		messages.forEach((m) => {
+			const key = m ?? "N/A";
+			counts.set(key, (counts.get(key) || 0) + 1);
+		});
+		return Array.from(counts.entries());
+	};
+
+	line(
+		` ================================================`,
+		` Engineering weekly updates: ${fmtDate(startDate)} - ${fmtDate(endDate)}`,
+		` ================================================`,
+	);
 	blank();
 
-	// Radar bugs
+	// 1. Radar bugs
 	const radarBugs = byKey.radarBugs;
 	if (radarBugs.error) {
-		line(`Radar Bugs error: ${radarBugs.error}`);
+		line(`1. Radar Bug Count: ERR — ${radarBugs.error}`);
 	} else {
 		const subjects = colValues(radarBugs.result, "subject");
-		line(`Radar Bug Count: ${subjects.length}`);
-		blank();
+		line(`1. Radar Bug Count: ${subjects.length}`);
 		subjects.forEach((s, i) =>
-			line(`${String.fromCharCode(97 + i)}. ${s ?? "N/A"}`),
+			line(`   ${String.fromCharCode(97 + i)}. ${s ?? "N/A"}`),
 		);
 	}
 
 	blank();
 
-	// 500 errors
+	// 2. 500 errors
 	const errUs = byKey.errors500Us;
 	const errEu = byKey.errors500Eu;
 	const usMessages = errUs.error ? [] : colValues(errUs.result, "message");
@@ -140,18 +283,108 @@ async function main() {
 	const usCount = errUs.error ? "ERR" : usMessages.length;
 	const euCount = errEu.error ? "ERR" : euMessages.length;
 
-	line(`500 Errors: ${usCount} (US) ${euCount} (EU)`);
+	line(`2. 500 Errors: ${usCount} (US) ${euCount} (EU)`);
+	if (errUs.error) line(`   US error: ${errUs.error}`);
+	else
+		groupByMessage(usMessages).forEach(([msg, count], i) =>
+			line(`   ${String.fromCharCode(97 + i)}. ${count} : ${msg}`),
+		);
+	if (errEu.error) line(`   EU error: ${errEu.error}`);
+	else
+		groupByMessage(euMessages).forEach(([msg, count], i) =>
+			line(`   ${String.fromCharCode(97 + i)}. ${count} : ${msg}`),
+		);
+
 	blank();
-	if (errUs.error) line(`US error: ${errUs.error}`);
-	else
-		usMessages.forEach((m, i) =>
-			line(`${String.fromCharCode(97 + i)}. ${m ?? "N/A"}`),
+
+	// 3. Query performance
+	const perf = byKey.performance;
+	line("3. Query Performance Breakdown");
+	blank();
+	if (perf.error) {
+		line(`   Performance error: ${perf.error}`);
+	} else {
+		const val = (col) => colValues(perf.result, col)[0] ?? 0;
+
+		line("   a. MySQL Query Performance");
+		const mysqlTotal = val("mysql_total");
+		line(`   Total Queries: ${fmtNum(mysqlTotal)}`);
+		line(
+			`   50 – 100 ms:   ${fmtNum(val("mysql_50_100ms"))} (${pct(val("mysql_50_100ms"), mysqlTotal)})`,
 		);
-	if (errEu.error) line(`EU error: ${errEu.error}`);
-	else
-		euMessages.forEach((m, i) =>
-			line(`${String.fromCharCode(97 + i)}. ${m ?? "N/A"}`),
+		line(
+			`   100 – 200 ms:  ${fmtNum(val("mysql_101_200ms"))} (${pct(val("mysql_101_200ms"), mysqlTotal)})`,
 		);
+		line(
+			`   200 – 500 ms:  ${fmtNum(val("mysql_201_500ms"))} (${pct(val("mysql_201_500ms"), mysqlTotal)})`,
+		);
+		line(
+			`   500 – 1000 ms: ${fmtNum(val("mysql_501_1000ms"))} (${pct(val("mysql_501_1000ms"), mysqlTotal)})`,
+		);
+		line(
+			`   > 1000 ms:     ${fmtNum(val("mysql_gt_1000ms"))} (${pct(val("mysql_gt_1000ms"), mysqlTotal)})`,
+		);
+
+		blank();
+
+		line("   b. Clickhouse Query Performance");
+		const clickTotal = val("click_total");
+		line(`   Total Queries: ${fmtNum(clickTotal)}`);
+		line(
+			`   50 – 100 ms:   ${fmtNum(val("click_50_100ms"))} (${pct(val("click_50_100ms"), clickTotal)})`,
+		);
+		line(
+			`   100 – 200 ms:  ${fmtNum(val("click_101_200ms"))} (${pct(val("click_101_200ms"), clickTotal)})`,
+		);
+		line(
+			`   200 – 500 ms:  ${fmtNum(val("click_200_500ms"))} (${pct(val("click_200_500ms"), clickTotal)})`,
+		);
+		line(
+			`   500 – 1000 ms: ${fmtNum(val("click_500_1000ms"))} (${pct(val("click_500_1000ms"), clickTotal)})`,
+		);
+		line(
+			`   > 1000 ms:     ${fmtNum(val("click_gt_10s"))} (${pct(val("click_gt_10s"), clickTotal)})`,
+		);
+	}
+
+	blank();
+
+	// 4. Top 3 slowest queries
+	const slow = byKey.slowQueries;
+	line("4. Top 3 Slowest Queries");
+	blank();
+	if (slow.error) {
+		line(`   Slow queries error: ${slow.error}`);
+	} else {
+		const rows = slow.result.data.rows;
+		const cols = slow.result.data.cols;
+		const colIdx = (name) =>
+			cols.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+
+		const qIdx = colIdx("query");
+		const oIdx = colIdx("occurrences");
+		const maxIdx = colIdx("maxTimeTaken");
+		const avgIdx = colIdx("avgTimeTaken");
+
+		rows.slice(0, 3).forEach((row, i) => {
+			const letter = String.fromCharCode(97 + i);
+			const occurrences = row[oIdx] ?? "N/A";
+			const maxMs =
+				row[maxIdx] != null ? `${fmtNum(Math.round(row[maxIdx]))} ms` : "N/A";
+			const avgMs =
+				row[avgIdx] != null ? `${fmtNum(Math.round(row[avgIdx]))} ms` : "N/A";
+			const rawQuery = (row[qIdx] ?? "N/A")
+				.replace(/`/g, "")
+				.replace(/\s+/g, " ")
+				.trim();
+
+			line(
+				`   ${letter}. [${occurrences} occurrences] [max: ${maxMs} | avg: ${avgMs}]`,
+			);
+			line(`      ${rawQuery}`);
+			blank();
+		});
+	}
 
 	console.log(lines.join("\n"));
 }
